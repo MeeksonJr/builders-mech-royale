@@ -1,14 +1,13 @@
-"""MeeksonLabs Mech Royale Survival Bot.
+"""MeeksonLabs Mech Royale Tactical Combat & Survival Bot.
 
-Strategy:
-  1. Placement-first objective (Placement = 16 - place; kills award 0 points).
-  2. Hive-mind evasion: The 15 house bots share vision and focus on the weakest visible target.
-     Holding fire and breaking line of sight prevents drawing the squad's aggro.
-  3. Zone perimeter positioning: Navigates using potential fields to stay on the safe inner rim
-     of the contracting circle rather than standing in the exposed dead center.
-  4. Defensive upgrade preference: Prioritizes armor, max HP, and speed/energy over weapon upgrades.
-  5. Reactive evasion: Boosts and jumps perpendicular to incoming fire upon taking damage.
-  6. Endgame execution: Transitions to aggressive firing when 4 or fewer mechs remain.
+Tactics:
+  1. Relentless target-leading accuracy: computes exact projectile travel time (speed ~252 m/s)
+     to lead enemy velocity vectors for devastating hit rates.
+  2. Combat strafing: moves perpendicular to the primary target while maintaining forward progress
+     toward the safe zone center, throwing off incoming enemy fire.
+  3. Zone dominance: prioritizes entering and holding the safe zone (boosts immediately when outside).
+  4. Reactive threat targeting: immediately pivots and retaliates against the specific enemy that damaged us.
+  5. Secondary weapon collection & upgrade selection for maximum survivability.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import mechfight as mf
 
 
 class Bot:
-    name = "MeeksonSurvival"
+    name = "MeeksonCombat"
 
     def __init__(self, hello: mf.Hello):
         self.reach = hello["config"]["loot"]["pickup_radius"]
@@ -29,17 +28,16 @@ class Bot:
         x, y, z = me["pos"]
         act: mf.Action = {"tick": obs["tick"]}
 
-        # 1. Automatic upgrade selection (prefer survivability)
+        # 1. Automatic upgrade selection (prefer armor/hp/speed)
         if obs["offer"]:
             choices = obs["offer"]["choices"]
             best_choice = 0
             best_score = -100
             for idx, c in enumerate(choices):
                 kind = c.get("kind", "").lower()
-                # Score defensive perks highest
-                if any(k in kind for k in ("armor", "hp", "health", "shield", "resist")):
+                if any(k in kind for k in ("armor", "hp", "health", "shield")):
                     score = 100
-                elif any(k in kind for k in ("speed", "jet", "energy", "boost", "dash")):
+                elif any(k in kind for k in ("speed", "jet", "energy", "boost")):
                     score = 80
                 elif any(k in kind for k in ("lightning", "mortar", "laser")):
                     score = 60
@@ -50,92 +48,118 @@ class Bot:
                     best_choice = idx
             act["pick"] = best_choice
 
-        # 2. Weapon pickup for empty slot
+        # 2. Weapon pickup for empty secondary slot
         near_pickups = [p for p in obs["pickups"] if math.dist(p["pos"][:2], (x, y)) < self.reach]
         if me["weapons"][1] is None and near_pickups:
-            # Prefer heavy secondary: lightning > mortar > laser > gun
             pref = {"lightning": 4, "mortar": 3, "laser": 2, "gun": 1}
             best_p = max(near_pickups, key=lambda p: pref.get(p.get("kind", ""), 0))
             act["take"] = best_p["id"]
 
-        # 3. Zone Navigation & Potential Field Movement
+        # 3. Identify primary target
+        enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
+        damaged_events = [e for e in obs.get("events", []) if e.get("type") == "damaged" and e.get("by") is not None]
+        
+        target = None
+        if damaged_events:
+            attacker_id = damaged_events[-1]["by"]
+            for em in enemies:
+                if em["id"] == attacker_id:
+                    target = em
+                    break
+        if target is None and enemies:
+            # Target closest enemy
+            target = min(enemies, key=lambda m: math.dist(m["pos"], me["pos"]))
+
+        # 4. Movement: Safe Zone Vector + Combat Strafe
         zone = obs["zone"]
         next_c = zone["next_center"]
-        next_r = zone["next_radius"]
-
         dx_zone = next_c[0] - x
         dy_zone = next_c[1] - y
         dist_to_center = math.hypot(dx_zone, dy_zone)
 
-        # Repulsion from visible enemies
-        enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        repel_x = 0.0
-        repel_y = 0.0
-        for em in enemies:
-            ex, ey, ez = em["pos"]
-            edist = math.hypot(x - ex, y - ey)
-            if edist < 60.0 and edist > 0.001:
-                weight = 1500.0 / (edist * edist)
-                repel_x += ((x - ex) / edist) * weight
-                repel_y += ((y - ey) / edist) * weight
-
-        # Combine zone attraction + enemy repulsion
-        # If we are comfortably within 70% of safe radius, zone pull is gentle
-        safe_margin = max(15.0, next_r * 0.75)
-        if dist_to_center > safe_margin:
-            zone_weight = 1.0 + (dist_to_center - safe_margin) / 20.0
-        else:
-            zone_weight = 0.2
-
         if dist_to_center > 0.001:
-            norm_zx = dx_zone / dist_to_center
-            norm_zy = dy_zone / dist_to_center
+            zx = dx_zone / dist_to_center
+            zy = dy_zone / dist_to_center
         else:
-            norm_zx, norm_zy = 0.0, 0.0
+            zx, zy = 0.0, 0.0
 
-        move_x = norm_zx * zone_weight + repel_x
-        move_y = norm_zy * zone_weight + repel_y
+        if target is not None:
+            # Compute strafe vector perpendicular to target
+            tx, ty, _ = target["pos"]
+            dx_t = tx - x
+            dy_t = ty - y
+            d_t = math.hypot(dx_t, dy_t)
+            if d_t > 0.001:
+                ux_t = dx_t / d_t
+                uy_t = dy_t / d_t
+                # Alternating strafe based on tick (reverses every 3 seconds to avoid running into walls)
+                strafe_dir = 1.0 if (obs["tick"] // 60) % 2 == 0 else -1.0
+                strafe_x = -uy_t * strafe_dir
+                strafe_y = ux_t * strafe_dir
+            else:
+                strafe_x, strafe_y = 0.0, 0.0
+
+            # Blend: 60% toward zone, 40% strafe
+            if not me["in_zone"] or dist_to_center > zone["next_radius"]:
+                # Outside zone: 90% toward zone!
+                move_x = zx * 0.9 + strafe_x * 0.1
+                move_y = zy * 0.9 + strafe_y * 0.1
+            else:
+                move_x = zx * 0.5 + strafe_x * 0.5
+                move_y = zy * 0.5 + strafe_y * 0.5
+        else:
+            move_x, move_y = zx, zy
+
         move_len = math.hypot(move_x, move_y)
         if move_len > 0.001:
             move_cmd = [move_x / move_len, move_y / move_len]
         else:
-            move_cmd = [norm_zx, norm_zy]
+            move_cmd = [zx, zy]
 
-        # 4. Evasion & Mobility
-        was_damaged = any(e.get("type") == "damaged" for e in obs.get("events", []))
-        should_boost = (not me["in_zone"]) or was_damaged or (dist_to_center > next_r)
-        should_jump = was_damaged and me["grounded"] and (obs["tick"] % 15 == 0)
+        # Boost when out of zone or taking damage
+        is_damaged = bool(damaged_events)
+        boost = (not me["in_zone"]) or is_damaged or (dist_to_center > zone["next_radius"])
+        jump = is_damaged and me["grounded"] and (obs["tick"] % 30 == 0)
 
-        act.update(move=move_cmd, boost=should_boost, jump=should_jump)
+        # 5. Aiming & Ballistic Lead Firing
+        if target is not None:
+            tx, ty, tz = target["pos"]
+            vx, vy, vz = target.get("vel", [0.0, 0.0, 0.0])
+            t_dist = math.dist(target["pos"], me["pos"])
+            t_flight = t_dist / max(100.0, self.gun_speed)
 
-        # 5. Aiming and Fire Discipline
-        # In endgame (alive <= 4) or when under direct attack (< 28m), fire back!
-        alive = obs["alive"]
-        closest_enemy = min(enemies, key=lambda m: math.dist(m["pos"], me["pos"])) if enemies else None
-        closest_dist = math.dist(closest_enemy["pos"], me["pos"]) if closest_enemy else 9999.0
-
-        should_fire = (alive <= 4) or (closest_dist < 28.0) or (was_damaged and closest_dist < 45.0)
-
-        if closest_enemy and should_fire:
-            tx, ty, tz = closest_enemy["pos"]
-            vx, vy, vz = closest_enemy.get("vel", [0, 0, 0])
-            t_flight = closest_dist / max(50.0, self.gun_speed)
+            # Predictive lead
             lead_x = tx + vx * t_flight
             lead_y = ty + vy * t_flight
-            lead_z = tz + 4.5 + vz * t_flight
+            lead_z = tz + 4.5 + vz * t_flight  # Target center of mass (height 4.5)
 
-            aim_yaw = math.atan2(lead_y - y, lead_x - x)
-            aim_pitch = math.atan2(lead_z - (z + 7.0), math.hypot(lead_x - x, lead_y - y))
-            act.update(aim=[aim_yaw, aim_pitch], fire=[True, True])
-            mf.draw.line([x, y, z + 7.0], [lead_x, lead_y, lead_z], "#00ffcc")
+            diff_x = lead_x - x
+            diff_y = lead_y - y
+            diff_z = lead_z - (z + 7.0)  # Muzzle height is 7.0
+
+            aim_yaw = math.atan2(diff_y, diff_x)
+            aim_pitch = math.atan2(diff_z, math.hypot(diff_x, diff_y))
+
+            # Fire both primary and secondary weapons continuously at target!
+            act.update(
+                move=move_cmd,
+                aim=[aim_yaw, aim_pitch],
+                fire=[True, True],
+                boost=boost,
+                jump=jump,
+            )
+            mf.draw.line([x, y, z + 7.0], [lead_x, lead_y, lead_z], "#ff2200")
         else:
-            # Look in direction of motion to watch for incoming threats
-            face_yaw = math.atan2(move_cmd[1], move_cmd[0])
-            act.update(aim=[face_yaw, 0.0], fire=[False, False])
+            # Face forward
+            yaw = math.atan2(move_cmd[1], move_cmd[0])
+            act.update(
+                move=move_cmd,
+                aim=[yaw, 0.0],
+                fire=[False, False],
+                boost=boost,
+                jump=jump,
+            )
 
-        # Debug overlay
-        mf.draw.point([next_c[0], next_c[1], z], "#00ff88", 6)
-        mf.draw.label(f"HP {me['hp']:.0f} | Alive {alive} | Dist {dist_to_center:.0f}m")
         return act
 
 
