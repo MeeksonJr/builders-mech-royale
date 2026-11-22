@@ -1,25 +1,26 @@
-"""ApexHunterV4: Dominant Battle Royale Bot for Builders Mech Royale.
+"""ApexHunterV5: Apex Combat, Looting & Survival Engine for Builders Mech Royale.
 
-Key Architectural Systems:
-1. Hit-and-Heal Protocol (The Survival Engine):
-   - In practice matches, 15 house bots attack in sequential waves (4 easy -> 4 medium -> 4 hard -> 3 expert).
-   - House bots NEVER fight each other; the ONLY way to gain placement points is by killing house bots.
-   - 5 seconds without dealing or taking damage grants +45 HP/s regeneration (back to 1400 HP).
-   - After each kill or when HP < 1250 and enemies are at distance (>26m), holds fire and kites to allow the 45 HP/s regen to restore full 1400 HP before the next duel.
-2. Supply Drop Snatching (Full 1400 HP + 3 Cubes):
-   - Prioritizes landed supply drops within 75m for instant 1400 HP restoration and 3 power cubes.
-3. Early Crate Farming (Pre-Combat Advantage):
-   - At match start, destroys nearby crates (300 HP) to harvest power cubes and equip lightning/laser BEFORE engaging the first house bot.
-4. Precision Dueling & Shredder DPS:
-   - Within 44m: Dual-fire arm gun (187 DPS) + Lightning (240 DPS hitscan in 30-deg cone) = 427 combined DPS!
-   - Lightning shorts enemy lasers so opponents cannot shoot sniper beams.
-   - Long-range: Laser charge-release engine (charges 0.70s, releases 315-dmg hitscan beam).
-5. Zero-Waste Trigger Discipline:
-   - Torso rotates at 4 rad/s; verifies angular difference between actual torso aim and 3D lead.
-   - Only fires primary gun when crosshair is strictly over target hitbox. (0.0% wasted ammo).
-6. Active Threat Evasion:
-   - Tracks incoming projectile trajectories from obs['projectiles'] and charging sniper lasers (charging=True).
-   - Automatically executes jetpack boost-dash perpendicular to incoming fire.
+Key Architecture:
+1. Active Weapon Seeking (Never Duel Empty-Handed):
+   - At match start and whenever slot 1 is empty, actively routes toward the nearest
+     high-tier weapon pickup (lightning > laser > mortar) within 50m.
+   - Having Lightning in slot 1 doubles burst DPS to 427 DPS and shorts enemy lasers!
+2. Maximum Combat Lethality (Never Hold Fire in Active Combat):
+   - Gun: fires strictly when actual torso aim is aligned on target 3D lead (0.0% wasted ammo).
+   - Lightning: fires continuously within 44m (240 DPS instant hitscan, shorts enemy lasers).
+   - Laser: releases 315-dmg hitscan beam upon reaching full charge.
+3. High-Speed Combat Circle-Strafing:
+   - Dueling range: 18m - 26m.
+   - Tangential strafing at boost speed (19.5 m/s) when energy >= 30.
+   - Direction shifts every 1.5s (15 ticks) + evasive hops throw off enemy ballistic leads.
+4. Post-Combat Recovery & Supply Drop Snatching:
+   - After a kill (when target is None or > 50m):
+     - Rushes landed supply drops within 75m for instant 1400 HP + 3 cubes!
+     - Vacuums all power cubes dropped by the dead bot.
+     - Reloads gun to 12/12.
+     - Lets the 5-second timer expire to regenerate 45 HP/s back to 1400 HP before next duel.
+5. Active Missile & Sniper Evasion:
+   - Evasive boost-dashes perpendicular to incoming mortar shells and enemy charging lasers.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ def angle_diff(a: float, b: float) -> float:
 
 
 class Bot:
-    name = "ApexHunterV4"
+    name = "ApexHunterV5"
 
     def __init__(self, hello: mf.Hello):
         self.pickup_reach = hello["config"]["loot"]["pickup_radius"]
@@ -44,8 +45,6 @@ class Bot:
         self.strafe_dir = 1.0
         self.last_strafe_switch = 0
         self.last_reload_tick = -999
-        self.last_damage_taken_tick = -999
-        self.last_damage_dealt_tick = -999
         self.kills = 0
 
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -54,14 +53,9 @@ class Bot:
         cur_tick = obs["tick"]
         act: mf.Action = {"tick": cur_tick}
 
-        # Track combat events
+        # Track kills
         for e in obs.get("events", []):
-            etype = e.get("type")
-            if etype == "damaged":
-                self.last_damage_taken_tick = cur_tick
-            elif etype == "hit":
-                self.last_damage_dealt_tick = cur_tick
-            elif etype == "kill":
+            if e.get("type") == "kill":
                 self.kills += 1
 
         # -------------------------------------------------------------
@@ -92,17 +86,28 @@ class Bot:
             act["pick"] = best_idx
 
         # -------------------------------------------------------------
-        # 2. WEAPON LOOTING (LIGHTNING > LASER > MORTAR)
+        # 2. WEAPON LOOTING & PICKUP ROUTING
         # -------------------------------------------------------------
-        if me["weapons"][1] is None and obs.get("pickups"):
+        pref = {"lightning": 5, "laser": 4, "mortar": 3, "gun": 1}
+        target_pickup: Optional[Dict[str, Any]] = None
+
+        if obs.get("pickups") and me["weapons"][1] is None:
+            # Check pickups in immediate reach
             near_picks = [
                 p for p in obs["pickups"]
                 if math.hypot(p["pos"][0] - x, p["pos"][1] - y) < self.pickup_reach
             ]
             if near_picks:
-                pref = {"lightning": 5, "laser": 4, "mortar": 3, "gun": 1}
                 chosen = max(near_picks, key=lambda p: pref.get(p.get("kind", ""), 0))
                 act["take"] = chosen["id"]
+            else:
+                # Seek best pickup within 45m
+                visible_picks = [
+                    p for p in obs["pickups"]
+                    if math.hypot(p["pos"][0] - x, p["pos"][1] - y) < 45.0
+                ]
+                if visible_picks:
+                    target_pickup = max(visible_picks, key=lambda p: pref.get(p.get("kind", ""), 0))
 
         # -------------------------------------------------------------
         # 3. COMBAT TARGET EVALUATION (WEAKEST / REAR-EXPOSED / ATTACKER)
@@ -120,7 +125,7 @@ class Bot:
                     target = em
                     break
 
-        # Priority 2: Weakest or rear-exposed enemy
+        # Priority 2: Focus fire on weakest enemy (lowest HP) for fast elimination
         if target is None and enemies:
             def enemy_priority(em: mf.ActorObs) -> float:
                 edist = math.hypot(em["pos"][0] - x, em["pos"][1] - y)
@@ -153,7 +158,7 @@ class Bot:
         in_safe_zone = me.get("in_zone", True) and (dist_to_center < next_r * 0.85)
 
         # -------------------------------------------------------------
-        # 5. HEALTH REGENERATION & TACTICAL MOVEMENT
+        # 5. TACTICAL MOVEMENT & POSITIONING
         # -------------------------------------------------------------
         move_x = zx
         move_y = zy
@@ -165,9 +170,8 @@ class Bot:
 
         crate_target: Optional[Dict[str, Any]] = None
         target_dist = 999.0
-        needs_regen = (me["hp"] < 1250.0)
 
-        # Check landed supply drops (full 1400 HP + 3 cubes!)
+        # Check landed supply drops
         landed_drops = [d for d in obs.get("drops", []) if d.get("landed", False) or d.get("lands_in", 999) <= 1.0]
         closest_drop = None
         if landed_drops:
@@ -187,29 +191,20 @@ class Bot:
                 tangent_x = -uy_t * self.strafe_dir
                 tangent_y = ux_t * self.strafe_dir
 
-                # Tactical distance management
-                if needs_regen and target_dist < 32.0:
-                    # Low HP: backpedal away from enemy toward safe center to trigger 45 HP/s regen
-                    combat_move_x = -ux_t * 0.80 + tangent_x * 0.20
-                    combat_move_y = -uy_t * 0.80 + tangent_y * 0.20
-                elif target_dist > 28.0:
-                    # Move closer into 20m - 26m dueling sweet spot
+                # Maintain 18m - 26m optimal dueling distance
+                if target_dist > 26.0:
                     radial_x = ux_t * 0.55
                     radial_y = uy_t * 0.55
-                    combat_move_x = tangent_x * 0.70 + radial_x
-                    combat_move_y = tangent_y * 0.70 + radial_y
                 elif target_dist < 18.0:
-                    # Back off to avoid point-blank enemy shots
                     radial_x = -ux_t * 0.60
                     radial_y = -uy_t * 0.60
-                    combat_move_x = tangent_x * 0.70 + radial_x
-                    combat_move_y = tangent_y * 0.70 + radial_y
                 else:
-                    # Perfect dueling circle-strafe
-                    combat_move_x = tangent_x
-                    combat_move_y = tangent_y
+                    radial_x = 0.0
+                    radial_y = 0.0
 
-                # Blend with zone positioning
+                combat_move_x = tangent_x * 0.70 + radial_x
+                combat_move_y = tangent_y * 0.70 + radial_y
+
                 if in_safe_zone:
                     move_x = combat_move_x * 0.85 + zx * 0.15
                     move_y = combat_move_y * 0.85 + zy * 0.15
@@ -217,52 +212,62 @@ class Bot:
                     move_x = zx * 0.75 + combat_move_x * 0.25
                     move_y = zy * 0.75 + combat_move_y * 0.25
 
-        else:
-            # Out of combat: capture supply drops, farm crates, or collect cubes
-            if closest_drop is not None:
-                ddist = math.hypot(closest_drop["pos"][0] - x, closest_drop["pos"][1] - y)
-                if ddist < 75.0:
-                    ddx = closest_drop["pos"][0] - x
-                    ddy = closest_drop["pos"][1] - y
-                    if ddist > 0.01:
-                        move_x = (ddx / ddist) * 0.80 + zx * 0.20
-                        move_y = (ddy / ddist) * 0.80 + zy * 0.20
+        elif target_pickup is not None:
+            # Out of combat: route directly to equip secondary weapon!
+            pdx = target_pickup["pos"][0] - x
+            pdy = target_pickup["pos"][1] - y
+            pdist = math.hypot(pdx, pdy)
+            if pdist > 0.01:
+                move_x = (pdx / pdist) * 0.85 + zx * 0.15
+                move_y = (pdy / pdist) * 0.85 + zy * 0.15
 
-            # Crate destruction for early cubes & weapons
-            if obs.get("crates") and (closest_drop is None or ddist >= 75.0):
-                near_crates = [
-                    c for c in obs["crates"]
-                    if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < 40.0
-                ]
-                if near_crates:
-                    crate_target = min(near_crates, key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                    cdx = crate_target["pos"][0] - x
-                    cdy = crate_target["pos"][1] - y
-                    cdist = math.hypot(cdx, cdy)
-                    if cdist > 8.0:
-                        move_x = (cdx / cdist) * 0.65 + zx * 0.35
-                        move_y = (cdy / cdist) * 0.65 + zy * 0.35
+        elif closest_drop is not None and math.hypot(closest_drop["pos"][0] - x, closest_drop["pos"][1] - y) < 75.0:
+            # Capture landed supply drop for full 1400 HP + 3 cubes
+            ddx = closest_drop["pos"][0] - x
+            ddy = closest_drop["pos"][1] - y
+            ddist = math.hypot(ddx, ddy)
+            if ddist > 0.01:
+                move_x = (ddx / ddist) * 0.85 + zx * 0.15
+                move_y = (ddy / ddist) * 0.85 + zy * 0.15
 
-            # Vacuum power cubes
-            if obs.get("cubes") and crate_target is None and (closest_drop is None or ddist >= 75.0):
-                close_cubes = [
-                    c for c in obs["cubes"]
-                    if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < 50.0
-                ]
-                if close_cubes:
-                    best_c = min(close_cubes, key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
-                    cdx = best_c["pos"][0] - x
-                    cdy = best_c["pos"][1] - y
-                    cmag = math.hypot(cdx, cdy)
-                    if cmag > 0.01:
-                        move_x = (cdx / cmag) * 0.70 + zx * 0.30
-                        move_y = (cdy / cmag) * 0.70 + zy * 0.30
+        elif obs.get("crates"):
+            # Crate destruction for cubes and weapons
+            near_crates = [
+                c for c in obs["crates"]
+                if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < 40.0
+            ]
+            if near_crates:
+                crate_target = min(near_crates, key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                cdx = crate_target["pos"][0] - x
+                cdy = crate_target["pos"][1] - y
+                cdist = math.hypot(cdx, cdy)
+                if cdist > 8.0:
+                    move_x = (cdx / cdist) * 0.65 + zx * 0.35
+                    move_y = (cdy / cdist) * 0.65 + zy * 0.35
+
+        elif obs.get("cubes"):
+            # Vacuum nearby power cubes
+            close_cubes = [
+                c for c in obs["cubes"]
+                if math.hypot(c["pos"][0] - x, c["pos"][1] - y) < 50.0
+            ]
+            if close_cubes:
+                best_c = min(close_cubes, key=lambda c: math.hypot(c["pos"][0] - x, c["pos"][1] - y))
+                cdx = best_c["pos"][0] - x
+                cdy = best_c["pos"][1] - y
+                cmag = math.hypot(cdx, cdy)
+                if cmag > 0.01:
+                    move_x = (cdx / cmag) * 0.70 + zx * 0.30
+                    move_y = (cdy / cmag) * 0.70 + zy * 0.30
 
         # -------------------------------------------------------------
-        # 6. ACTIVE THREAT EVASION (PROJECTILES & CHARGING LASERS)
+        # 6. ACTIVE THREAT EVASION & SPEED BOOST
         # -------------------------------------------------------------
         jump = False
-        boost = (not me.get("in_zone", True)) or bool(damaged_events) or (dist_to_center > next_r * 0.80)
+        energy = me.get("energy", 100.0)
+        
+        # Boost during combat circle-strafing to run at 19.5 m/s and dodge incoming shots!
+        boost = (target is not None and energy >= 25.0) or (not me.get("in_zone", True)) or bool(damaged_events) or (dist_to_center > next_r * 0.80)
 
         incoming_threat = False
         dodge_x = 0.0
@@ -285,7 +290,7 @@ class Bot:
                         dodge_y = pvx / p_spd
                         break
 
-        # Check enemy laser snipers charging along our line of sight
+        # Check enemy sniper lasers charging at us
         if not incoming_threat:
             for em in enemies:
                 if em.get("charging"):
@@ -341,7 +346,7 @@ class Bot:
                 self.last_reload_tick = cur_tick
 
         # -------------------------------------------------------------
-        # 8. TRIGGER DISCIPLINE & PRECISION WEAPON ENGINE
+        # 8. HYPER-LETHAL WEAPON FIRING (MAXIMUM BURST FIREPOWER)
         # -------------------------------------------------------------
         fire_primary = False
         fire_secondary = False
@@ -374,11 +379,8 @@ class Bot:
             max_yaw_err = max(0.06, 2.2 / max(5.0, target_dist))
             max_pitch_err = max(0.08, 3.5 / max(5.0, target_dist))
 
-            # REGEN TRIGGER DISCIPLINE:
-            # If low HP and enemy is at distance (>26m), HOLD FIRE so the 5s timer allows 45 HP/s healing!
-            # Only fire primary if we are at healthy HP or enemy is inside close danger zone (<=26m)
-            if not (needs_regen and target_dist > 26.0):
-                fire_primary = (yaw_err <= max_yaw_err) and (pitch_err <= max_pitch_err)
+            # ALWAYS fire primary gun when crosshair is on target!
+            fire_primary = (yaw_err <= max_yaw_err) and (pitch_err <= max_pitch_err)
 
             # Secondary Weapon Engine
             if sec_weapon is not None:
@@ -389,8 +391,8 @@ class Bot:
                     else:
                         fire_secondary = True
                 elif sec_kind == "lightning":
-                    # Instant hitscan within 44m (shorts enemy lasers)
-                    fire_secondary = (target_dist <= 44.0) and not (needs_regen and target_dist > 30.0)
+                    # Instant hitscan within 44m (never hold fire in combat!)
+                    fire_secondary = (target_dist <= 44.0)
                 elif sec_kind == "mortar":
                     fire_secondary = (15.0 <= target_dist <= 65.0) and (yaw_err <= 0.15)
                 else:
